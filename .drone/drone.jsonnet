@@ -1,8 +1,21 @@
-local grafanaVersions = ['8.3.3', '8.2.7', '8.1.8', '8.0.7', '7.5.12'];
+local grafanaVersions = ['9.5.1', '9.4.9', '9.3.13', '9.2.13', '8.5.24', '7.5.17'];
 local images = {
-  go: 'golang:1.16',
-  lint: 'golangci/golangci-lint',
+  go: 'golang:1.20',
+  python: 'python:3.11-alpine',
+  lint: 'golangci/golangci-lint:v1.52',
+  terraform: 'hashicorp/terraform',
   grafana(version): 'grafana/grafana:' + version,
+  grafanaEnterprise(version): 'grafana/grafana-enterprise:' + version,
+};
+
+local terraformPath = '/drone/terraform-provider-grafana/terraform';
+local installTerraformStep = {
+  name: 'download-terraform',
+  image: images.terraform,
+  commands: [
+    'cp /bin/terraform ' + terraformPath,
+    'chmod a+x ' + terraformPath,
+  ],
 };
 
 local secret(name, vaultPath, vaultKey) = {
@@ -12,12 +25,26 @@ local secret(name, vaultPath, vaultKey) = {
     path: vaultPath,
     name: vaultKey,
   },
-
-  fromSecret:: { from_secret: name },
 };
-local cloudApiKey = secret('grafana-cloud-api-key', 'infra/data/ci/terraform-provider-grafana/cloud', 'cloud-api-key');
-local apiToken = secret('grafana-api-token', 'infra/data/ci/terraform-provider-grafana/cloud', 'api-key');
-local smToken = secret('grafana-sm-token', 'infra/data/ci/terraform-provider-grafana/cloud', 'sm-access-token');
+
+local fromSecret(secret) = {
+  from_secret: secret.name,
+};
+
+local secrets = {
+  // Grafana Cloud API test secrets
+  cloudOrg: secret('grafana-cloud-org', 'infra/data/ci/terraform-provider-grafana/cloud', 'cloud-org'),
+  cloudApiKey: secret('grafana-cloud-api-key', 'infra/data/ci/terraform-provider-grafana/cloud', 'cloud-api-key'),
+
+  // Grafana Cloud Instance test secrets
+  cloudInstanceUrl: secret('grafana-cloud-instance-url', 'infra/data/ci/terraform-provider-grafana/cloud', 'cloud-instance-url'),
+  apiToken: secret('grafana-api-token', 'infra/data/ci/terraform-provider-grafana/cloud', 'api-key'),
+  smToken: secret('grafana-sm-token', 'infra/data/ci/terraform-provider-grafana/cloud', 'sm-access-token'),
+  onCallToken: secret('grafana-oncall-token', 'infra/data/ci/terraform-provider-grafana/cloud', 'oncall-access-token'),
+
+  // Grafana Enterprise
+  enterpriseLicense: secret('grafana-enterprise-license', 'infra/data/ci/terraform-provider-grafana/enterprise', 'license.jwt'),
+};
 
 local pipeline(name, steps, services=[]) = {
   kind: 'pipeline',
@@ -38,6 +65,49 @@ local pipeline(name, steps, services=[]) = {
   },
 };
 
+local withConcurrencyLimit(limit) = {
+  concurrency: { limit: limit },
+};
+
+local onPromoteTrigger = {
+  trigger: {
+    event: ['promote'],
+  },
+};
+
+local localTestPipeline(version, name='oss tests: %s' % version, makeTarget='testacc-oss', grafanaEnvMixin={}, grafanaImage=images.grafana) = pipeline(
+  name,
+  steps=[
+    installTerraformStep,
+    {
+      name: 'tests',
+      image: images.go,
+      commands: [
+        'sleep 5',  // https://docs.drone.io/pipeline/docker/syntax/services/#initialization
+        'make %s' % makeTarget,
+      ],
+      environment: {
+        GRAFANA_URL: 'http://grafana:3000',
+        GRAFANA_AUTH: 'admin:admin',
+        GRAFANA_VERSION: version,
+        GRAFANA_ORG_ID: 1,
+        TF_ACC_TERRAFORM_PATH: terraformPath,
+      },
+    },
+  ],
+  services=[
+    {
+      name: 'grafana',
+      image: grafanaImage(version),
+      environment: {
+        // Prevents error="database is locked"
+        GF_SERVER_ROOT_URL: 'http://grafana:3000',
+        GF_DATABASE_URL: 'sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL',
+      } + grafanaEnvMixin,
+    },
+  ],
+);
+
 [
   pipeline(
     'lint', steps=[
@@ -49,6 +119,15 @@ local pipeline(name, steps, services=[]) = {
           'golangci-lint run ./...',
         ],
       },
+      {
+        name: 'terraform-fmt',
+        image: images.terraform,
+        commands: [
+          |||
+            terraform fmt -recursive -check || (echo "Terraform files aren't formatted. Run 'terraform fmt -recursive && go generate'"; exit 1;)
+          |||,
+        ],
+      },
     ]
   ),
 
@@ -58,6 +137,7 @@ local pipeline(name, steps, services=[]) = {
         name: 'check for drift',
         image: images.go,
         commands: [
+          'apt update && apt install -y jq',
           'go generate',
           'gitstatus="$(git status --porcelain)"',
           'if [ -n "$gitstatus" ]; then',
@@ -67,62 +147,91 @@ local pipeline(name, steps, services=[]) = {
           'fi',
         ],
       },
+      {
+        name: 'check for broken links',
+        image: images.python,
+        commands: [
+          'pip3 install linkchecker',
+          'linkchecker --config ./.linkcheckerrc docs/',
+        ],
+      },
     ]
   ),
 
   pipeline(
-    'cloud tests',
+    'unit tests',
     steps=[
+      installTerraformStep,
       {
         name: 'tests',
         image: images.go,
         commands: [
-          'make testacc-cloud',
+          'go test ./...',
         ],
         environment: {
-          GRAFANA_URL: 'https://terraformprovidergrafana.grafana.net/',
-          GRAFANA_AUTH: apiToken.fromSecret,
-          GRAFANA_CLOUD_API_KEY: cloudApiKey.fromSecret,
-          GRAFANA_SM_ACCESS_TOKEN: smToken.fromSecret,
-          GRAFANA_ORG_ID: 1,
+          TF_ACC_TERRAFORM_PATH: terraformPath,
         },
       },
     ]
   ),
 
-  cloudApiKey,
-  apiToken,
-  smToken,
-] +
-[
   pipeline(
-    'oss tests: %s' % version,
+    'cloud api tests',
     steps=[
+      installTerraformStep,
       {
         name: 'tests',
         image: images.go,
         commands: [
-          'sleep 5',  // https://docs.drone.io/pipeline/docker/syntax/services/#initialization
-          'make testacc-oss',
+          'make testacc-cloud-api',
         ],
         environment: {
-          GRAFANA_URL: 'http://grafana:3000',
-          GRAFANA_AUTH: 'admin:admin',
-          GRAFANA_VERSION: version,
-          GRAFANA_ORG_ID: 1,
+          GRAFANA_CLOUD_API_KEY: fromSecret(secrets.cloudApiKey),
+          GRAFANA_CLOUD_ORG: fromSecret(secrets.cloudOrg),
+          TF_ACC_TERRAFORM_PATH: terraformPath,
         },
       },
-    ],
-    services=[
-      {
-        name: 'grafana',
-        image: images.grafana(version),
-        environment: {
-          // Prevents error="database is locked"
-          GF_DATABASE_URL: 'sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL',
-        },
-      },
-    ],
+    ]
   )
-  for version in grafanaVersions
+  + withConcurrencyLimit(1)
+  + onPromoteTrigger,
+
+  pipeline(
+    'cloud instance tests',
+    steps=[
+      installTerraformStep,
+      {
+        name: 'wait for instance',
+        image: images.go,
+        commands: ['.drone/wait-for-instance.sh $${GRAFANA_URL}'],
+        environment: {
+          GRAFANA_URL: fromSecret(secrets.cloudInstanceUrl),
+        },
+      },
+      {
+        name: 'tests',
+        image: images.go,
+        commands: ['make testacc-cloud-instance'],
+        environment: {
+          GRAFANA_URL: fromSecret(secrets.cloudInstanceUrl),
+          GRAFANA_AUTH: fromSecret(secrets.apiToken),
+          GRAFANA_SM_ACCESS_TOKEN: fromSecret(secrets.smToken),
+          GRAFANA_ORG_ID: 1,
+          GRAFANA_ONCALL_ACCESS_TOKEN: fromSecret(secrets.onCallToken),
+          TF_ACC_TERRAFORM_PATH: terraformPath,
+        },
+      },
+    ]
+  )
+  + withConcurrencyLimit(1),
+
+  localTestPipeline(
+    grafanaVersions[0],
+    name='enterprise tests',
+    makeTarget='testacc-enterprise',
+    grafanaEnvMixin={ GF_ENTERPRISE_LICENSE_TEXT: fromSecret(secrets.enterpriseLicense) },
+    grafanaImage=images.grafanaEnterprise
+  ),
 ]
++ [localTestPipeline(version) for version in grafanaVersions]
++ std.objectValuesAll(secrets)

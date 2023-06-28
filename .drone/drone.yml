@@ -9,8 +9,13 @@ steps:
 - commands:
   - golangci-lint --version
   - golangci-lint run ./...
-  image: golangci/golangci-lint
+  image: golangci/golangci-lint:v1.52
   name: lint
+- commands:
+  - |
+    terraform fmt -recursive -check || (echo "Terraform files aren't formatted. Run 'terraform fmt -recursive && go generate'"; exit 1;)
+  image: hashicorp/terraform
+  name: terraform-fmt
 trigger:
   branch:
   - master
@@ -29,6 +34,7 @@ platform:
 services: []
 steps:
 - commands:
+  - apt update && apt install -y jq
   - go generate
   - gitstatus="$(git status --porcelain)"
   - if [ -n "$gitstatus" ]; then
@@ -36,8 +42,13 @@ steps:
   - '  echo "docs are out of sync, run \"go generate\""'
   - '  exit 1'
   - fi
-  image: golang:1.16
+  image: golang:1.20
   name: check for drift
+- commands:
+  - pip3 install linkchecker
+  - linkchecker --config ./.linkcheckerrc docs/
+  image: python:3.11-alpine
+  name: check for broken links
 trigger:
   branch:
   - master
@@ -49,24 +60,22 @@ workspace:
   path: /drone/terraform-provider-grafana
 ---
 kind: pipeline
-name: cloud tests
+name: unit tests
 platform:
   arch: amd64
   os: linux
 services: []
 steps:
 - commands:
-  - make testacc-cloud
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - go test ./...
   environment:
-    GRAFANA_AUTH:
-      from_secret: grafana-api-token
-    GRAFANA_CLOUD_API_KEY:
-      from_secret: grafana-cloud-api-key
-    GRAFANA_ORG_ID: 1
-    GRAFANA_SM_ACCESS_TOKEN:
-      from_secret: grafana-sm-token
-    GRAFANA_URL: https://terraformprovidergrafana.grafana.net/
-  image: golang:1.16
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
   name: tests
 trigger:
   branch:
@@ -78,11 +87,350 @@ type: docker
 workspace:
   path: /drone/terraform-provider-grafana
 ---
-get:
-  name: cloud-api-key
-  path: infra/data/ci/terraform-provider-grafana/cloud
-kind: secret
-name: grafana-cloud-api-key
+concurrency:
+  limit: 1
+kind: pipeline
+name: cloud api tests
+platform:
+  arch: amd64
+  os: linux
+services: []
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - make testacc-cloud-api
+  environment:
+    GRAFANA_CLOUD_API_KEY:
+      from_secret: grafana-cloud-api-key
+    GRAFANA_CLOUD_ORG:
+      from_secret: grafana-cloud-org
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  event:
+  - promote
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+concurrency:
+  limit: 1
+kind: pipeline
+name: cloud instance tests
+platform:
+  arch: amd64
+  os: linux
+services: []
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - .drone/wait-for-instance.sh $${GRAFANA_URL}
+  environment:
+    GRAFANA_URL:
+      from_secret: grafana-cloud-instance-url
+  image: golang:1.20
+  name: wait for instance
+- commands:
+  - make testacc-cloud-instance
+  environment:
+    GRAFANA_AUTH:
+      from_secret: grafana-api-token
+    GRAFANA_ONCALL_ACCESS_TOKEN:
+      from_secret: grafana-oncall-token
+    GRAFANA_ORG_ID: 1
+    GRAFANA_SM_ACCESS_TOKEN:
+      from_secret: grafana-sm-token
+    GRAFANA_URL:
+      from_secret: grafana-cloud-instance-url
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: enterprise tests
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_ENTERPRISE_LICENSE_TEXT:
+      from_secret: grafana-enterprise-license
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana-enterprise:9.5.1
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-enterprise
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 9.5.1
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 9.5.1'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:9.5.1
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 9.5.1
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 9.4.9'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:9.4.9
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 9.4.9
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 9.3.13'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:9.3.13
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 9.3.13
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 9.2.13'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:9.2.13
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 9.2.13
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 8.5.24'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:8.5.24
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 8.5.24
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
+---
+kind: pipeline
+name: 'oss tests: 7.5.17'
+platform:
+  arch: amd64
+  os: linux
+services:
+- environment:
+    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
+    GF_SERVER_ROOT_URL: http://grafana:3000
+  image: grafana/grafana:7.5.17
+  name: grafana
+steps:
+- commands:
+  - cp /bin/terraform /drone/terraform-provider-grafana/terraform
+  - chmod a+x /drone/terraform-provider-grafana/terraform
+  image: hashicorp/terraform
+  name: download-terraform
+- commands:
+  - sleep 5
+  - make testacc-oss
+  environment:
+    GRAFANA_AUTH: admin:admin
+    GRAFANA_ORG_ID: 1
+    GRAFANA_URL: http://grafana:3000
+    GRAFANA_VERSION: 7.5.17
+    TF_ACC_TERRAFORM_PATH: /drone/terraform-provider-grafana/terraform
+  image: golang:1.20
+  name: tests
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+  - push
+type: docker
+workspace:
+  path: /drone/terraform-provider-grafana
 ---
 get:
   name: api-key
@@ -91,167 +439,42 @@ kind: secret
 name: grafana-api-token
 ---
 get:
+  name: cloud-api-key
+  path: infra/data/ci/terraform-provider-grafana/cloud
+kind: secret
+name: grafana-cloud-api-key
+---
+get:
+  name: cloud-instance-url
+  path: infra/data/ci/terraform-provider-grafana/cloud
+kind: secret
+name: grafana-cloud-instance-url
+---
+get:
+  name: cloud-org
+  path: infra/data/ci/terraform-provider-grafana/cloud
+kind: secret
+name: grafana-cloud-org
+---
+get:
+  name: license.jwt
+  path: infra/data/ci/terraform-provider-grafana/enterprise
+kind: secret
+name: grafana-enterprise-license
+---
+get:
+  name: oncall-access-token
+  path: infra/data/ci/terraform-provider-grafana/cloud
+kind: secret
+name: grafana-oncall-token
+---
+get:
   name: sm-access-token
   path: infra/data/ci/terraform-provider-grafana/cloud
 kind: secret
 name: grafana-sm-token
 ---
-kind: pipeline
-name: 'oss tests: 8.3.3'
-platform:
-  arch: amd64
-  os: linux
-services:
-- environment:
-    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
-  image: grafana/grafana:8.3.3
-  name: grafana
-steps:
-- commands:
-  - sleep 5
-  - make testacc-oss
-  environment:
-    GRAFANA_AUTH: admin:admin
-    GRAFANA_ORG_ID: 1
-    GRAFANA_URL: http://grafana:3000
-    GRAFANA_VERSION: 8.3.3
-  image: golang:1.16
-  name: tests
-trigger:
-  branch:
-  - master
-  event:
-  - pull_request
-  - push
-type: docker
-workspace:
-  path: /drone/terraform-provider-grafana
----
-kind: pipeline
-name: 'oss tests: 8.2.7'
-platform:
-  arch: amd64
-  os: linux
-services:
-- environment:
-    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
-  image: grafana/grafana:8.2.7
-  name: grafana
-steps:
-- commands:
-  - sleep 5
-  - make testacc-oss
-  environment:
-    GRAFANA_AUTH: admin:admin
-    GRAFANA_ORG_ID: 1
-    GRAFANA_URL: http://grafana:3000
-    GRAFANA_VERSION: 8.2.7
-  image: golang:1.16
-  name: tests
-trigger:
-  branch:
-  - master
-  event:
-  - pull_request
-  - push
-type: docker
-workspace:
-  path: /drone/terraform-provider-grafana
----
-kind: pipeline
-name: 'oss tests: 8.1.8'
-platform:
-  arch: amd64
-  os: linux
-services:
-- environment:
-    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
-  image: grafana/grafana:8.1.8
-  name: grafana
-steps:
-- commands:
-  - sleep 5
-  - make testacc-oss
-  environment:
-    GRAFANA_AUTH: admin:admin
-    GRAFANA_ORG_ID: 1
-    GRAFANA_URL: http://grafana:3000
-    GRAFANA_VERSION: 8.1.8
-  image: golang:1.16
-  name: tests
-trigger:
-  branch:
-  - master
-  event:
-  - pull_request
-  - push
-type: docker
-workspace:
-  path: /drone/terraform-provider-grafana
----
-kind: pipeline
-name: 'oss tests: 8.0.7'
-platform:
-  arch: amd64
-  os: linux
-services:
-- environment:
-    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
-  image: grafana/grafana:8.0.7
-  name: grafana
-steps:
-- commands:
-  - sleep 5
-  - make testacc-oss
-  environment:
-    GRAFANA_AUTH: admin:admin
-    GRAFANA_ORG_ID: 1
-    GRAFANA_URL: http://grafana:3000
-    GRAFANA_VERSION: 8.0.7
-  image: golang:1.16
-  name: tests
-trigger:
-  branch:
-  - master
-  event:
-  - pull_request
-  - push
-type: docker
-workspace:
-  path: /drone/terraform-provider-grafana
----
-kind: pipeline
-name: 'oss tests: 7.5.12'
-platform:
-  arch: amd64
-  os: linux
-services:
-- environment:
-    GF_DATABASE_URL: sqlite3:///var/lib/grafana/grafana.db?cache=private&mode=rwc&_journal_mode=WAL
-  image: grafana/grafana:7.5.12
-  name: grafana
-steps:
-- commands:
-  - sleep 5
-  - make testacc-oss
-  environment:
-    GRAFANA_AUTH: admin:admin
-    GRAFANA_ORG_ID: 1
-    GRAFANA_URL: http://grafana:3000
-    GRAFANA_VERSION: 7.5.12
-  image: golang:1.16
-  name: tests
-trigger:
-  branch:
-  - master
-  event:
-  - pull_request
-  - push
-type: docker
-workspace:
-  path: /drone/terraform-provider-grafana
----
 kind: signature
-hmac: 21722dfbb237f702dd2e062347c7adfeb8a15a7cf103670928142a975d743d33
+hmac: 8572c85ad5383fdfca39f76bd5615e26bf5e11936980629d4050d5bc49f95d70
 
 ...
